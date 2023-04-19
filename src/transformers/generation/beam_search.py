@@ -493,44 +493,9 @@ class ConstrainedBeamSearchScorer(BeamScorer):
         pad_token_id: Optional[int] = None,
         eos_token_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor]:
-        r"""
-        Args:
-            input_ids (`torch.LongTensor` of shape `(batch_size * num_beams, sequence_length)`):
-                Indices of input sequence tokens in the vocabulary.
-
-                Indices can be obtained using any class inheriting from [`PreTrainedTokenizer`]. See
-                [`PreTrainedTokenizer.encode`] and [`PreTrainedTokenizer.__call__`] for details.
-
-                [What are input IDs?](../glossary#input-ids)
-            next_scores (`torch.FloatTensor` of shape `(batch_size, 2 * num_beams)`):
-                Current scores of the top `2 * num_beams` non-finished beam hypotheses.
-            next_tokens (`torch.LongTensor` of shape `(batch_size, 2 * num_beams)`):
-                `input_ids` of the tokens corresponding to the top `2 * num_beams` non-finished beam hypotheses.
-            next_indices (`torch.LongTensor` of shape `(batch_size, 2 * num_beams)`):
-                Beam indices indicating to which beam hypothesis the `next_tokens` correspond.
-            scores_for_all_vocab (`torch.FloatTensor` of shape `(batch_size * num_beams, sequence_length)`):
-                The scores of all tokens in the vocabulary for each of the beam hypotheses.
-            pad_token_id (`int`, *optional*):
-                The id of the *padding* token.
-            eos_token_id (`int`, *optional*):
-                The id of the *end-of-sequence* token.
-
-        Return:
-            `UserDict`: A dictionary composed of the fields as defined above:
-
-                - **next_beam_scores** (`torch.FloatTensor` of shape `(batch_size * num_beams)`) -- Updated scores of
-                  all
-                non-finished beams.
-
-                - **next_beam_tokens** (`torch.FloatTensor` of shape `(batch_size * num_beams)`) -- Next tokens to be
-                  added
-                to the non-finished beam_hypotheses.
-                - **next_beam_indices** (`torch.FloatTensor` of shape `(batch_size * num_beams)`) -- Beam indices
-                indicating to which beam the next tokens shall be added.
-        """
-
         cur_len = input_ids.shape[-1]
         batch_size = len(self._beam_hyps)
+
         if not (batch_size == (input_ids.shape[0] // self.group_size)):
             if self.num_beam_groups > 1:
                 raise ValueError(
@@ -545,77 +510,47 @@ class ConstrainedBeamSearchScorer(BeamScorer):
 
         device = input_ids.device
 
+        # Initialize next beam variables with proper shape and dtype
         next_beam_scores = torch.zeros((batch_size, self.group_size), dtype=next_scores.dtype, device=device)
         next_beam_tokens = torch.zeros((batch_size, self.group_size), dtype=next_tokens.dtype, device=device)
         next_beam_indices = torch.zeros((batch_size, self.group_size), dtype=next_indices.dtype, device=device)
 
-        for batch_idx, beam_hyp in enumerate(self._beam_hyps):
-            if self._done[batch_idx]:
-                if self.num_beams < len(beam_hyp):
-                    raise ValueError(f"Batch can only be done if at least {self.num_beams} beams have been generated")
-                if eos_token_id is None or pad_token_id is None:
-                    raise ValueError("Generated beams >= num_beams -> eos_token_id and pad_token have to be defined")
-                # pad the batch
-                next_beam_scores[batch_idx, :] = 0
-                next_beam_tokens[batch_idx, :] = pad_token_id
-                next_beam_indices[batch_idx, :] = 0
-                continue
+        if self.num_beams < len(self._beam_hyps[0]):
+            raise ValueError(f"Batch can only be done if at least {self.num_beams} beams have been generated")
 
-            # next tokens for this sentence.
-            beam_idx = 0
-            for beam_token_rank, (next_token, next_score, next_index) in enumerate(
-                zip(next_tokens[batch_idx], next_scores[batch_idx], next_indices[batch_idx])
-            ):
-                batch_beam_idx = batch_idx * self.group_size + next_index
-                # add to generated hypotheses if end of sentence
-                if (eos_token_id is not None) and (next_token.item() == eos_token_id):
+        # Update next_beam variables based on the constraints
+        mask_eos = next_tokens == eos_token_id
+        mask_top_beams = torch.arange(2 * self.group_size, device=device).unsqueeze(0) < self.group_size
 
-                    # if beam_token does not belong to top num_beams tokens, it should not be added
-                    is_beam_token_worse_than_top_num_beams = beam_token_rank >= self.group_size
-                    if is_beam_token_worse_than_top_num_beams:
-                        continue
+        mask_update = (~mask_eos | mask_top_beams) & ~self._done.unsqueeze(-1)
+        next_beam_scores.masked_scatter_(mask_update, next_scores[mask_update])
+        next_beam_tokens.masked_scatter_(mask_update, next_tokens[mask_update])
+        next_beam_indices.masked_scatter_(mask_update, next_indices[mask_update])
 
-                    completes_constraint = self.check_completes_constraints(input_ids[batch_beam_idx].cpu().tolist())
-                    if completes_constraint:
-                        beam_hyp.add(
-                            input_ids[batch_beam_idx].clone(),
-                            next_score.item(),
-                        )
-                else:
-                    # add next predicted token since it is not eos_token
-                    next_beam_scores[batch_idx, beam_idx] = next_score
-                    next_beam_tokens[batch_idx, beam_idx] = next_token
-                    next_beam_indices[batch_idx, beam_idx] = batch_beam_idx
-                    beam_idx += 1
+        # Pad the finished beams
+        mask_pad = self._done.unsqueeze(-1)
+        next_beam_scores.masked_fill_(mask_pad, 0)
+        next_beam_tokens.masked_fill_(mask_pad, pad_token_id)
+        next_beam_indices.masked_fill_(mask_pad, 0)
 
-                # once the beam for next step is full, don't add more tokens to it.
-                if beam_idx == self.group_size:
-                    break
+        # Update completed constraints
+        mask_completed = self.check_completes_constraints(
+            input_ids.view(batch_size, self.group_size, -1).cpu().numpy()
+        )
+        completed_indices = mask_completed.nonzero(as_tuple=True)
+        for batch_idx, beam_idx in zip(*completed_indices):
+            batch_beam_idx = batch_idx * self.group_size + beam_idx
+            self._beam_hyps[batch_idx].add(input_ids[batch_beam_idx].clone(), next_scores[batch_idx, beam_idx].item())
 
-            new_scores, new_tokens, new_indices = self.step_sentence_constraint(
-                batch_idx,
-                input_ids,
-                scores_for_all_vocab,
-                next_beam_scores[batch_idx],
-                next_beam_tokens[batch_idx],
-                next_beam_indices[batch_idx],
-            )
+        # Update other necessary constraints
+        next_beam_scores, next_beam_tokens, next_beam_indices = self.step_sentence_constraint(
+            input_ids, scores_for_all_vocab, next_beam_scores, next_beam_tokens, next_beam_indices
+        )
 
-            next_beam_scores[batch_idx] = new_scores
-            next_beam_tokens[batch_idx] = new_tokens
-            next_beam_indices[batch_idx] = new_indices
+        # Check if all the beams are done
+        self._done = self._done | self.check_all_beams_done(next_beam_scores, cur_len)
 
-            if beam_idx < self.group_size:
-                raise ValueError(
-                    f"At most {self.group_size} tokens in {next_tokens[batch_idx]} can be equal to `eos_token_id:"
-                    f" {eos_token_id}`. Make sure {next_tokens[batch_idx]} are corrected."
-                )
-
-            # Check if we are done so that we can save a pad step if all(done)
-            self._done[batch_idx] = self._done[batch_idx] or beam_hyp.is_done(
-                next_scores[batch_idx].max().item(), cur_len
-            )
-
+        # Return the updated scores, tokens and indices
         return UserDict(
             {
                 "next_beam_scores": next_beam_scores.view(-1),
