@@ -205,6 +205,10 @@ class BeamSearchScorer(BeamScorer):
     def is_done(self) -> bool:
         return self._done.all()
 
+    import torch
+    from torch import Tensor
+    from typing import Optional, Tuple
+
     def process(
         self,
         input_ids: torch.LongTensor,
@@ -234,70 +238,67 @@ class BeamSearchScorer(BeamScorer):
         next_beam_tokens = torch.zeros((batch_size, self.group_size), dtype=next_tokens.dtype, device=device)
         next_beam_indices = torch.zeros((batch_size, self.group_size), dtype=next_indices.dtype, device=device)
 
-        for batch_idx, beam_hyp in enumerate(self._beam_hyps):
-            if self._done[batch_idx]:
-                if self.num_beams < len(beam_hyp):
-                    raise ValueError(f"Batch can only be done if at least {self.num_beams} beams have been generated")
-                if eos_token_id is None or pad_token_id is None:
-                    raise ValueError("Generated beams >= num_beams -> eos_token_id and pad_token have to be defined")
-                # pad the batch
-                next_beam_scores[batch_idx, :] = 0
-                next_beam_tokens[batch_idx, :] = pad_token_id
-                next_beam_indices[batch_idx, :] = 0
-                continue
+        # Calculate done and not_done masks for the batch
+        done = torch.tensor(self._done, dtype=torch.bool, device=device)
+        not_done = ~done
 
-            # next tokens for this sentence
-            beam_idx = 0
-            for beam_token_rank, (next_token, next_score, next_index) in enumerate(
-                zip(next_tokens[batch_idx], next_scores[batch_idx], next_indices[batch_idx])
-            ):
-                batch_beam_idx = batch_idx * self.group_size + next_index
-                # add to generated hypotheses if end of sentence
-                if (eos_token_id is not None) and (next_token.item() == eos_token_id):
-                    # if beam_token does not belong to top num_beams tokens, it should not be added
-                    is_beam_token_worse_than_top_num_beams = beam_token_rank >= self.group_size
-                    if is_beam_token_worse_than_top_num_beams:
-                        continue
-                    if beam_indices is not None:
-                        beam_index = beam_indices[batch_beam_idx]
-                        beam_index = beam_index + (batch_beam_idx,)
-                    else:
-                        beam_index = None
+        if done.sum() > 0:
+            if self.num_beams < len(self._beam_hyps[0]):
+                raise ValueError(f"Batch can only be done if at least {self.num_beams} beams have been generated")
+            if eos_token_id is None or pad_token_id is None:
+                raise ValueError("Generated beams >= num_beams -> eos_token_id and pad_token have to be defined")
+            # Pad the batch
+            next_beam_scores[done] = 0
+            next_beam_tokens[done] = pad_token_id
+            next_beam_indices[done] = 0
 
-                    beam_hyp.add(
-                        input_ids[batch_beam_idx].clone(),
-                        next_score.item(),
-                        beam_indices=beam_index,
-                    )
-                else:
-                    # add next predicted token since it is not eos_token
-                    next_beam_scores[batch_idx, beam_idx] = next_score
-                    next_beam_tokens[batch_idx, beam_idx] = next_token
-                    next_beam_indices[batch_idx, beam_idx] = batch_beam_idx
-                    beam_idx += 1
+        # Operate only on not_done sentences
+        next_indices = next_indices.view(batch_size, -1)[not_done].view(-1)
+        not_done_idx = torch.nonzero(not_done).squeeze(-1)
+        not_done_token_rank = torch.arange(next_tokens.shape[1], device=device)
 
-                # once the beam for next step is full, don't add more tokens to it.
-                if beam_idx == self.group_size:
-                    break
+        next_beam_token_mask = (eos_token_id is not None) & (next_tokens.view(batch_size, -1) == eos_token_id)
+        not_done_eos_indices = (not_done.unsqueeze(-1) & next_beam_token_mask.unsqueeze(0)).nonzero()[:, 1]
 
-            if beam_idx < self.group_size:
-                raise ValueError(
-                    f"At most {self.group_size} tokens in {next_tokens[batch_idx]} can be equal to `eos_token_id:"
-                    f" {eos_token_id}`. Make sure {next_tokens[batch_idx]} are corrected."
-                )
+        for batch_idx, _ in enumerate(not_done_eos_indices):
+            if beam_indices is not None:
+                batch_beam_idx = not_done_idx[batch_idx] * self.group_size + not_done_eos_indices[batch_idx]
+                beam_index = beam_indices[batch_beam_idx]
+                beam_index = beam_index + (batch_beam_idx,)
+            else:
+                beam_index = None
 
-            # Check if we are done so that we can save a pad step if all(done)
-            self._done[batch_idx] = self._done[batch_idx] or beam_hyp.is_done(
-                next_scores[batch_idx].max().item(), cur_len
+            beam_hyp = self._beam_hyps[not_done_idx[batch_idx]]
+            input_idx = not_done_idx[batch_idx] * self.group_size + not_done_eos_indices[batch_idx]
+
+            beam_hyp.add(
+                input_ids[input_idx].clone(),
+                next_scores[batch_idx, not_done_eos_indices[batch_idx]].item(),
+                beam_indices=beam_index,
             )
 
-        return UserDict(
-            {
-                "next_beam_scores": next_beam_scores.view(-1),
-                "next_beam_tokens": next_beam_tokens.view(-1),
-                "next_beam_indices": next_beam_indices.view(-1),
-            }
+        # Set tokens that are not equal to eos_token_id
+        not_eos_tokens = (next_tokens.view(batch_size, -1) != eos_token_id).view(batch_size, -1, 1)
+        next_beam_scores.copy_(next_scores.view(batch_size, -1, 1) * not_eos_tokens)
+
+        next_beam_tokens.copy_(next_tokens.view(batch_size, -1, 1) * not_eos_tokens)
+
+        next_beam_indices.copy_(next_indices.view(batch_size, -1, 1) * not_eos_tokens)
+
+        # Check if we are done so that we can save a pad step if all(done)
+        self._done = torch.tensor(self._done) | torch.stack(
+            [
+                beam_hyp.is_done(next_scores[not_done_idx[i]].max().item(), cur_len)
+                for i, beam_hyp in enumerate(self._beam_hyps)
+                if not_done[i]
+            ]
         )
+
+        return {
+            "next_beam_scores": next_beam_scores.view(-1),
+            "next_beam_tokens": next_beam_tokens.view(-1),
+            "next_beam_indices": next_beam_indices.view(-1),
+        }
 
     def finalize(
         self,
@@ -569,7 +570,6 @@ class ConstrainedBeamSearchScorer(BeamScorer):
                 batch_beam_idx = batch_idx * self.group_size + next_index
                 # add to generated hypotheses if end of sentence
                 if (eos_token_id is not None) and (next_token.item() == eos_token_id):
-
                     # if beam_token does not belong to top num_beams tokens, it should not be added
                     is_beam_token_worse_than_top_num_beams = beam_token_rank >= self.group_size
                     if is_beam_token_worse_than_top_num_beams:
