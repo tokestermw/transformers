@@ -2381,19 +2381,12 @@ class Trainer:
         if self.args.push_to_hub:
             self._push_from_checkpoint(staging_output_dir)
 
-        # Place checkpoint in final location after all saving is finished.
-        if os.path.exists(output_dir) and len(os.listdir(output_dir)) > 0:
-            logger.warning(
-                f"Checkpoint destination directory {output_dir} already exists and is non-empty."
-                "Saving will proceed but saved results may be invalid."
-            )
-            staging_output_dir = output_dir
-        else:
-            # staging_output_dir = os.path.join(run_dir, f"tmp-{checkpoint_folder}")
-            staging_output_dir = output_dir
-        if staging_output_dir != output_dir:
+        if self.args.should_save and staging_output_dir != output_dir:
             # https://github.com/huggingface/transformers/issues/27925
-            os.rename(staging_output_dir, output_dir)
+            try:
+                os.rename(staging_output_dir, output_dir)
+            except Exception as e:
+                logger.exception(f'(motoki) Ignoring error.')
 
         # Maybe delete some older checkpoints.
         if self.args.should_save:
