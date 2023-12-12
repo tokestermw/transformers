@@ -2383,6 +2383,7 @@ class Trainer:
 
         # Place checkpoint in final location after all saving is finished.
         if self.args.should_save and staging_output_dir != output_dir:
+            # https://github.com/huggingface/transformers/issues/27925
             os.rename(staging_output_dir, output_dir)
 
         # Maybe delete some older checkpoints.
